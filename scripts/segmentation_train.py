@@ -1,0 +1,140 @@
+import sys
+import argparse
+
+sys.path.append("..")
+sys.path.append(".")
+from guided_diffusion import dist_util, logger
+from guided_diffusion.resample import create_named_schedule_sampler
+from guided_diffusion.bratsloader import *
+from guided_diffusion.isicloader import ISICDataset
+from guided_diffusion.myloader import MyDataset
+from guided_diffusion.BYYAloader import BYYADataset
+from guided_diffusion.kvasir_loader import KvasirDataset
+from guided_diffusion.script_util import (
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+    args_to_dict,
+    add_dict_to_argparser,
+)
+import torch as th
+from guided_diffusion.train_util import TrainLoop
+# from visdom import Visdom
+# viz = Visdom(port=8097)
+import torchvision.transforms as transforms
+
+def main():
+    args = create_argparser().parse_args()
+
+    dist_util.setup_dist(args)
+    logger.configure(dir=args.out_dir)
+
+    logger.log("creating data loader...")
+
+    if args.data_name == 'ISIC':
+        tran_list = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor(), transforms.Normalize([0.70844054,0.5821276,0.53606266],[0.15572749,0.16400227,0.17911644])]
+        transform_train_img = transforms.Compose(tran_list)
+        transform_train_mask = transforms.Compose(tran_list[:-1])
+        ds = ISICDataset(args.data_dir, transform_train_img,transform_train_mask,mode='Training')
+        args.in_ch = 4
+
+    elif args.data_name == 'MY':
+        tran_list = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor(), ]
+        transform_train = transforms.Compose(tran_list)
+        ds = MyDataset(args, args.data_dir, transform_train)
+        args.in_ch = 4
+
+    elif args.data_name == 'KVASIR':
+        tran_list = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor(), transforms.Normalize([0.55715865,0.32168046,0.23578914],[0.31722644,0.21997158,0.18551587])]
+        transform_train_img = transforms.Compose(tran_list[:-1])
+        transform_train_mask = transforms.Compose(tran_list[:-1])
+        ds = KvasirDataset(args.data_dir, transform_train_img,transform_train_mask)
+        args.in_ch = 4
+
+    elif args.data_name == 'BRATS':
+        tran_list = [myNormalize(mean=[246.0692, 208.3315, 338.0198, 165.9171],std=[716.8119, 635.6193, 941.2881, 642.6382]),myResize(args.image_size,args.image_size)]
+        transform_train = transforms.Compose(tran_list)
+        ds = BRATSDataset_5H(args.data_dir, transform_train, test_flag=False)
+        args.in_ch = 5
+    
+    elif args.data_name == 'BYYA':
+        tran_list = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor(), transforms.Normalize([0.70844054,0.5821276,0.53606266],[0.15572749,0.16400227,0.17911644])]
+        transform_train_img = transforms.Compose(tran_list)
+        transform_train_mask = transforms.Compose(tran_list[:-1])
+        ds = BYYADataset(args.data_dir, transform_train_img,transform_train_mask,mode='Training')
+        args.in_ch = 4
+
+    datal = th.utils.data.DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=10)
+    data = iter(datal)
+
+    logger.log("creating model and diffusion...")
+
+    model, diffusion, distribution = create_model_and_diffusion(
+        **args_to_dict(args, model_and_diffusion_defaults().keys())
+    )
+    if args.multi_gpu:
+        model = th.nn.DataParallel(model, device_ids=[int(id) for id in args.multi_gpu.split(',')])
+        model.to(device=th.device('cuda', int(args.gpu_dev)))
+    else:
+        model.to(dist_util.dev())
+    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion, maxt=args.diffusion_steps)
+
+    logger.log("training...")
+    # torch.cuda.empty_cache()
+    TrainLoop(
+        model=model,
+        diffusion=diffusion,
+        classifier=None,
+        data=data,
+        dataloader=datal,
+        batch_size=args.batch_size,
+        microbatch=args.microbatch,
+        lr=args.lr,
+        ema_rate=args.ema_rate,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        resume_checkpoint=args.resume_checkpoint,
+        use_fp16=args.use_fp16,
+        fp16_scale_growth=args.fp16_scale_growth,
+        schedule_sampler=schedule_sampler,
+        weight_decay=args.weight_decay,
+        lr_anneal_steps=args.lr_anneal_steps,
+        distribution = distribution
+        # prior = prior,
+        # posterior = posterior,
+    ).run_loop()
+
+
+def create_argparser():
+    defaults = dict(
+        data_name='BYYA',
+        data_dir="/media/kemove/sata/TIANXIAO/tianxiao/DFMIS/Dataset/train",
+        schedule_sampler="uniform",
+        lr=1e-4,
+        weight_decay = 0.0,
+        lr_anneal_steps=0,
+        batch_size=1,
+        microbatch=-1,  # -1 disables microbatches
+        ema_rate="0.9999",  # comma-separated list of EMA values
+        log_interval=100,
+        save_interval=10000,
+        resume_checkpoint=None,  # "/results/pretrainedmodel.pt"
+        use_fp16=False,
+        fp16_scale_growth=1e-3,
+        gpu_dev="0",
+        multi_gpu=None,  # "0,1,2"
+        out_dir='./results/'
+    )
+    defaults.update(model_and_diffusion_defaults())
+    parser = argparse.ArgumentParser()
+    add_dict_to_argparser(parser, defaults)
+    return parser
+
+
+if __name__ == "__main__":
+    main()
+
+
